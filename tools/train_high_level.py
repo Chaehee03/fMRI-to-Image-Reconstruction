@@ -706,7 +706,7 @@ def main():
         in_dim = int(roi_tr.shape[1])
         del roi_tr
 
-    # 전역 z-score 통계 로드
+    # z-score 통계
     zscore_tensors = None
     if args.zscore_stats is not None and os.path.exists(args.zscore_stats):
         zs = np.load(args.zscore_stats)
