@@ -5,10 +5,10 @@ train_high_level.py
 
 ROI별 fMRI → (MLP backbone → BERT-style masking) → 2층 MLP projector → 텍스트 잠복벡터(z) 예측
 타깃 z는 Optimus-BERT 인코더(가능하면)로 COCO 캡션을 인코딩해서 얻음.
-Optimus 사용이 불가하면 안전한 폴백으로 HuggingFace BERT의 [CLS] 풀드 임베딩을 사용.
+Optimus 사용이 불가하면 HuggingFace BERT의 [CLS] 풀드 임베딩을 사용.
 
 필수 경로:
-- NSD_ROOT:    /NSD  (기본값)  └ nsddata/experiments/nsd/nsd_expdesign.mat (73KID→COCO image id 매핑)
+- NSD_ROOT:    /NSD  (기본값)   nsddata/experiments/nsd/nsd_expdesign.mat (73KID→COCO image id 매핑)
 - COCO captions: /NSD/nsddata_stimuli/stimuli/nsd/annotations/captions_{train,val}2017.json
 
 선택:
@@ -19,8 +19,7 @@ Optimus 사용이 불가하면 안전한 폴백으로 HuggingFace BERT의 [CLS] 
 import os
 import sys
 import json
-import math
-import time
+
 import random
 import argparse
 import traceback
@@ -34,7 +33,6 @@ import torch.nn.functional as F
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 
-# ---- 프로젝트 내부 모듈 (이미 제공된 것과 동일) ----
 from datasets.RoiNsdDataset import RoiNsdDataset
 import utils
 
@@ -46,113 +44,113 @@ except Exception:
 BAR_FMT = "{l_bar}{bar:30}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]"
 LOG_EVERY_N = int(os.getenv("LOG_EVERY_N", "0"))
 
-class OptimusMuEncoder(nn.Module):
-    """
-    - BERT(base-uncased) pooled output -> Linear(2*latent) -> (mu, logvar)
-    - encode_texts()는 posterior mean(mu)를 반환
-    - optimus_ckpt가 있으면 가능한 키를 매핑해 로드(느슨한 로딩)
-    """
-    def __init__(
-        self,
-        device: torch.device,
-        preferred_latent_dim: int = 768,
-        max_len: int = 64,
-        optimus_ckpt: Optional[str] = None,
-    ):
-        super().__init__()
-        self.device = device
-        self.max_len = max_len
-        self.latent_dim = int(preferred_latent_dim)
-        self.use_pooled_as_mu = False  # 기본값
-
-        # tokenizer (신버전 우선)
-        try:
-            from transformers import BertTokenizer, BertModel
-            self._use_hf = True
-        except Exception:
-            from pytorch_transformers import BertTokenizer, BertModel
-            self._use_hf = False
-
-        self.tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
-        # BERT backbone
-        if self._use_hf:
-            from transformers import BertModel
-            self.bert = BertModel.from_pretrained("bert-base-uncased")
-        else:
-            from pytorch_transformers import BertModel, BertConfig
-            self.bert = BertModel.from_pretrained("bert-base-uncased")
-
-        hidden = self.bert.config.hidden_size  # 보통 768
-        # Optimus는 bert_fea -> linear(2*latent)로 (mu, logvar) 생성
-        self.linear = nn.Linear(hidden, 2 * self.latent_dim, bias=True)
-
-        # ckpt가 있으면 가능한 만큼 로드
-        if optimus_ckpt is not None and os.path.exists(optimus_ckpt):
-            self._load_loose_state_dict(optimus_ckpt)
-
-        self.to(self.device).eval()
-        for p in self.parameters():
-            p.requires_grad_(False)
-
-        print(f"[OptimusMuEncoder] ready (latent_dim={self.latent_dim}, hf={self._use_hf})", flush=True)
-
-    def _load_loose_state_dict(self, ckpt_path: str):
-        print(f"[OptimusMuEncoder] loading ckpt (loose): {ckpt_path}")
-        state = torch.load(ckpt_path, map_location="cpu")
-        if isinstance(state, dict) and "state_dict" in state:
-            state = state["state_dict"]
-
-        # 접두사 정리
-        def strip_prefix(d, prefix):
-            return { (k[len(prefix):] if k.startswith(prefix) else k): v for k, v in d.items() }
-
-        state = strip_prefix(state, "module.")
-        # Optimus 계열에서 흔한 접두사
-        for pre in ["encoder.", "model.", "vae.", "text_vae.", "bert_vae.", "vae_module."]:
-            state = strip_prefix(state, pre)
-
-        # bert.*와 linear.*만 뽑기
-        bert_sd = {k: v for k, v in state.items() if k.startswith("bert.")}
-        head_sd = {}
-        # 다양한 이름 후보: linear, encoder.linear, bert_connector.linear 등
-        for k, v in state.items():
-            if k.startswith("linear.") or "encoder.linear." in k or "bert_connector.linear." in k:
-                # 키를 linear.* 형태로 정규화
-                nk = k.split("linear.", 1)[-1] if "linear." in k else k.split("encoder.linear.", 1)[-1]
-                nk = nk if nk and (nk.startswith("weight") or nk.startswith("bias")) else os.path.basename(k)
-                head_sd[f"linear.{nk}"] = v
-
-        miss_bert, unexp_bert = self.bert.load_state_dict(bert_sd, strict=False)
-        miss_head, unexp_head = self.linear.load_state_dict(head_sd, strict=False)
-        print(f"  - bert:    loaded={len(bert_sd)}  missing={len(miss_bert)}  unexpected={len(unexp_bert)}")
-        print(f"  - linear:  loaded={len(head_sd)}  missing={len(miss_head)} unexpected={len(unexp_head)}")
-
-        head_ok = ("linear.weight" in head_sd and "linear.bias" in head_sd)
-        if not head_ok:
-            self.use_pooled_as_mu = True
-            self.latent_dim = self.bert.config.hidden_size  # 보통 768
-            print("[OptimusMuEncoder] No usable VAE head found -> using BERT pooled output as mu.")
-
-    @torch.no_grad()
-    def encode_texts(self, texts: List[str]) -> torch.Tensor:
-        if len(texts) == 0:
-            return torch.empty(0, self.latent_dim, device=self.device, dtype=torch.float32)
-
-        enc = self.tokenizer(
-            texts, padding=True, truncation=True, max_length=self.max_len, return_tensors="pt"
-        )
-        enc = {k: v.to(self.device) for k, v in enc.items()}
-
-        out = self.bert(**enc, return_dict=True)
-        pooled = out.pooler_output if (hasattr(out, "pooler_output") and out.pooler_output is not None) \
-            else out.last_hidden_state[:, 0, :]
-
-        if getattr(self, "use_pooled_as_mu", False):
-            return pooled.float()
-
-        mean_logvar = self.linear(pooled)  # [B, 2*latent]
-        mu, logvar = mean_logvar.chunk(2, dim=-1)
-        return mu.float()
+# class OptimusMuEncoder(nn.Module):
+#     """
+#     - BERT(base-uncased) pooled output -> Linear(2*latent) -> (mu, logvar)
+#     - encode_texts()는 posterior mean(mu)를 반환
+#     - optimus_ckpt가 있으면 가능한 키를 매핑해 로드(느슨한 로딩)
+#     """
+#     def __init__(
+#         self,
+#         device: torch.device,
+#         preferred_latent_dim: int = 768,
+#         max_len: int = 64,
+#         optimus_ckpt: Optional[str] = None,
+#     ):
+#         super().__init__()
+#         self.device = device
+#         self.max_len = max_len
+#         self.latent_dim = int(preferred_latent_dim)
+#         self.use_pooled_as_mu = False  # 기본값
+#
+#         # tokenizer (신버전 우선)
+#         try:
+#             from transformers import BertTokenizer, BertModel
+#             self._use_hf = True
+#         except Exception:
+#             from pytorch_transformers import BertTokenizer, BertModel
+#             self._use_hf = False
+#
+#         self.tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+#         # BERT backbone
+#         if self._use_hf:
+#             from transformers import BertModel
+#             self.bert = BertModel.from_pretrained("bert-base-uncased")
+#         else:
+#             from pytorch_transformers import BertModel, BertConfig
+#             self.bert = BertModel.from_pretrained("bert-base-uncased")
+#
+#         hidden = self.bert.config.hidden_size  # 보통 768
+#         # Optimus는 bert_fea -> linear(2*latent)로 (mu, logvar) 생성
+#         self.linear = nn.Linear(hidden, 2 * self.latent_dim, bias=True)
+#
+#         # ckpt가 있으면 가능한 만큼 로드
+#         if optimus_ckpt is not None and os.path.exists(optimus_ckpt):
+#             self._load_loose_state_dict(optimus_ckpt)
+#
+#         self.to(self.device).eval()
+#         for p in self.parameters():
+#             p.requires_grad_(False)
+#
+#         print(f"[OptimusMuEncoder] ready (latent_dim={self.latent_dim}, hf={self._use_hf})", flush=True)
+#
+#     def _load_loose_state_dict(self, ckpt_path: str):
+#         print(f"[OptimusMuEncoder] loading ckpt (loose): {ckpt_path}")
+#         state = torch.load(ckpt_path, map_location="cpu")
+#         if isinstance(state, dict) and "state_dict" in state:
+#             state = state["state_dict"]
+#
+#         # 접두사 정리
+#         def strip_prefix(d, prefix):
+#             return { (k[len(prefix):] if k.startswith(prefix) else k): v for k, v in d.items() }
+#
+#         state = strip_prefix(state, "module.")
+#         # Optimus 계열에서 흔한 접두사
+#         for pre in ["encoder.", "models.", "vae.", "text_vae.", "bert_vae.", "vae_module."]:
+#             state = strip_prefix(state, pre)
+#
+#         # bert.*와 linear.*만 뽑기
+#         bert_sd = {k: v for k, v in state.items() if k.startswith("bert.")}
+#         head_sd = {}
+#         # 다양한 이름 후보: linear, encoder.linear, bert_connector.linear 등
+#         for k, v in state.items():
+#             if k.startswith("linear.") or "encoder.linear." in k or "bert_connector.linear." in k:
+#                 # 키를 linear.* 형태로 정규화
+#                 nk = k.split("linear.", 1)[-1] if "linear." in k else k.split("encoder.linear.", 1)[-1]
+#                 nk = nk if nk and (nk.startswith("weight") or nk.startswith("bias")) else os.path.basename(k)
+#                 head_sd[f"linear.{nk}"] = v
+#
+#         miss_bert, unexp_bert = self.bert.load_state_dict(bert_sd, strict=False)
+#         miss_head, unexp_head = self.linear.load_state_dict(head_sd, strict=False)
+#         print(f"  - bert:    loaded={len(bert_sd)}  missing={len(miss_bert)}  unexpected={len(unexp_bert)}")
+#         print(f"  - linear:  loaded={len(head_sd)}  missing={len(miss_head)} unexpected={len(unexp_head)}")
+#
+#         head_ok = ("linear.weight" in head_sd and "linear.bias" in head_sd)
+#         if not head_ok:
+#             self.use_pooled_as_mu = True
+#             self.latent_dim = self.bert.config.hidden_size  # 보통 768
+#             print("[OptimusMuEncoder] No usable VAE head found -> using BERT pooled output as mu.")
+#
+#     @torch.no_grad()
+#     def encode_texts(self, texts: List[str]) -> torch.Tensor:
+#         if len(texts) == 0:
+#             return torch.empty(0, self.latent_dim, device=self.device, dtype=torch.float32)
+#
+#         enc = self.tokenizer(
+#             texts, padding=True, truncation=True, max_length=self.max_len, return_tensors="pt"
+#         )
+#         enc = {k: v.to(self.device) for k, v in enc.items()}
+#
+#         out = self.bert(**enc, return_dict=True)
+#         pooled = out.pooler_output if (hasattr(out, "pooler_output") and out.pooler_output is not None) \
+#             else out.last_hidden_state[:, 0, :]
+#
+#         if getattr(self, "use_pooled_as_mu", False):
+#             return pooled.float()
+#
+#         mean_logvar = self.linear(pooled)  # [B, 2*latent]
+#         mu, logvar = mean_logvar.chunk(2, dim=-1)
+#         return mu.float()
 
 
 
@@ -329,6 +327,58 @@ def _load_coco_id_vec_from_csv(csv_path: str) -> Optional[np.ndarray]:
     print(f"[coco csv] loaded cocoId: shape={coco.shape}, NaNs(before cast)={n_nan}, path={csv_path}")
     return coco
 
+# === OpenCLIP-based Text Encoder (ViT-L/14) ===
+class ClipTextEncoder(nn.Module):
+    """
+    OpenCLIP 텍스트 인코더로 캡션 임베딩을 얻음.
+    - encode_texts(texts) -> [B, D] float32
+    - self.latent_dim: 텍스트 임베딩 차원 (보통 768 for ViT-L/14)
+    - self.normalize: L2 정규화 여부
+    """
+    def __init__(self, device: torch.device,
+                 clip_variant: str = "ViT-L-14",
+                 pretrained: str = "openai",
+                 normalize: bool = True):
+        super().__init__()
+        try:
+            import open_clip
+        except Exception as e:
+            raise ImportError(
+                "open_clip_torch 가 필요합니다. `pip install open_clip_torch` 후 다시 실행하세요."
+            ) from e
+        self.open_clip = open_clip
+        self.device = device
+        self.normalize = bool(normalize)
+
+        # 모델/토크나이저 로드
+        self.model, _, _ = open_clip.create_model_and_transforms(
+            clip_variant, pretrained=pretrained, device=device
+        )
+        # OpenCLIP 토크나이저
+        self.tokenize = open_clip.tokenize
+        self.model.eval()
+        for p in self.model.parameters():
+            p.requires_grad_(False)
+
+        # latent_dim 추정
+        if hasattr(self.model, "text_projection"):
+            self.latent_dim = int(self.model.text_projection.shape[1])
+        else:
+            self.latent_dim = int(getattr(self.model, "embed_dim", 768))
+
+        print(f"[ClipTextEncoder] ready (variant={clip_variant}, pretrained={pretrained}, "
+              f"latent_dim={self.latent_dim}, normalize={self.normalize})", flush=True)
+
+    @torch.no_grad()
+    def encode_texts(self, texts: List[str]) -> torch.Tensor:
+        if len(texts) == 0:
+            return torch.empty(0, self.latent_dim, device=self.device, dtype=torch.float32)
+        toks = self.tokenize(texts).to(self.device)
+        feats = self.model.encode_text(toks, normalize=False)  # [B, D], dtype may be fp16
+        feats = feats.float()
+        return feats
+
+
 
 class CaptionProvider:
     """
@@ -393,7 +443,7 @@ class CaptionProvider:
     @staticmethod
     @torch.no_grad()
     def build_or_load_text_targets(cap_provider: "CaptionProvider",
-                                   text_enc: "OptimusMuEncoder",
+                                   text_enc: "nn.Module",
                                    used_trials: List[int],
                                    cache_path: Optional[str],
                                    device: torch.device,
@@ -402,10 +452,12 @@ class CaptionProvider:
         Returns:
           z_cache: (N_trials, D) float32, missing=nan
           valid:   (N_trials,) bool
-        If cache_path exists, loads from npz; else computes for used_trials and saves.
+
+        - 캡션별 임베딩을 L2 정규화하고 평균한 뒤, 최종 벡터도 L2 정규화.
         """
         N = len(cap_provider.map73k) if cap_provider.map73k is not None else (max(used_trials) + 1)
-        D = text_enc.latent_dim
+        D = int(getattr(text_enc, "latent_dim", 768))
+
         if cache_path is not None and os.path.exists(cache_path):
             npz = np.load(cache_path)
             z_cache = npz["z_cache"].astype(np.float32)
@@ -413,11 +465,9 @@ class CaptionProvider:
             assert z_cache.shape == (N, D), f"cache shape mismatch: {z_cache.shape} vs {(N, D)}"
             return z_cache, valid
 
-        # init
         z_cache = np.full((N, D), np.nan, dtype=np.float32)
         valid = np.zeros((N,), dtype=bool)
 
-        # compute only for used_trials
         for t in used_trials:
             if cap_provider.map73k is None or not (0 <= t < len(cap_provider.map73k)):
                 continue
@@ -428,9 +478,16 @@ class CaptionProvider:
             if not caps:
                 continue
 
-            # encode all caps, average -> h_GT
-            z = text_enc.encode_texts(caps)  # [K, D] on device
+            # ---- caption embeddings ----
+            # (1) 캡션별 벡터: [K, D]
+            z = text_enc.encode_texts(caps)  # torch [K, D] on device
+            # (2) 정규화
+            z = F.normalize(z, dim=-1)
+            # (3) 평균
             z = z.mean(dim=0, keepdim=False)  # [D]
+            # (4) 최종 벡터 L2 정규화
+            z = F.normalize(z, dim=0)
+
             z_cache[t] = z.detach().cpu().float().numpy()
             valid[t] = True
 
@@ -439,6 +496,7 @@ class CaptionProvider:
             np.savez_compressed(cache_path, z_cache=z_cache, valid=valid)
             print(f"[cap-cache] saved: {cache_path} (shape={z_cache.shape}, valid={valid.sum()})", flush=True)
         return z_cache, valid
+
 
 
 # ============================================================
@@ -478,7 +536,7 @@ def main():
     parser.add_argument("--input-layernorm", action=argparse.BooleanOptionalAction, default=True)
 
     # --- 로깅/저장 ---
-    parser.add_argument("--model-name", type=str, default="high_text_latent")
+    parser.add_argument("--models-name", type=str, default="high_text_latent")
     parser.add_argument("--ckpt-interval", type=int, default=10)
     parser.add_argument("--save-dir", type=str, default=None)
 
@@ -497,7 +555,38 @@ def main():
     parser.add_argument("--bottleneck-dim", type=int, default=0,
                         help="If >0, add a learned Linear bottleneck (in_dim->bottleneck_dim) before backbone.")
 
+    # === OpenCLIP args ===
+    # pip install open_clip_torch
+    parser.add_argument("--text-encoder", type=str, default="clip",
+                        choices=["clip"], help="text target encoder")
+    parser.add_argument("--clip-pretrained", type=str, default="openai",
+                        help="OpenCLIP pretrained tag (e.g., openai, laion2b_s32b_b82k)")
+    parser.add_argument("--clip-normalize", action=argparse.BooleanOptionalAction, default=True,
+                        help="L2-normalize text features (per-caption and final mean)")
+
+    parser.add_argument("--nce-temp", type=float, default=0.06,
+                        help="InfoNCE temperature (mid-level은 ~0.06)")
+
+    parser.add_argument("--target-normalize", action=argparse.BooleanOptionalAction, default=False,
+                        help="캐시에 저장할 텍스트 타깃을 L2 정규화할지 여부 (mid-style=False)")
+
+    # --- CLIP & contrastive training 옵션 ---
+    parser.add_argument("--clip-variant", type=str, default="ViT-L/14",
+                        choices=["RN50", "ViT-L/14", "ViT-B/32", "RN50x64"])
+    parser.add_argument("--hidden", action=argparse.BooleanOptionalAction, default=True,
+                        help="True면 ViT-L/14의 마지막 히든스테이트(257x768)를 사용하고, False면 pooled(768)")
+    parser.add_argument("--norm-embs", action=argparse.BooleanOptionalAction, default=True,
+                        help="Clipper 내부 L2 norm 사용 여부(실제 손실 직전에 다시 정규화함)")
+    parser.add_argument("--mixup_pct", type=float, default=0.33,
+                        help="학습 전반 중 BiMixCo를 사용할 비율(이후 SoftCLIP)")
+    parser.add_argument("--nce_temp", type=float, default=0.06,
+                        help="BiMixCo 단계에서의 temperature")
+    parser.add_argument("--softclip_tmin", type=float, default=0.004)
+    parser.add_argument("--softclip_tmax", type=float, default=0.0075)
+
     args = parser.parse_args()
+
+    text_variant = args.clip_variant.replace("/", "-")
 
     # ---- 73k→COCO id 매핑 로드 ----
     coco_id_vec = None
@@ -513,7 +602,7 @@ def main():
 
     # 출력 디렉터리
     ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-    outdir = args.save_dir or os.path.join(ROOT_DIR, "train_logs", "high", args.model_name)
+    outdir = args.save_dir or os.path.join(ROOT_DIR, "train_logs", "high", args.models_name)
     os.makedirs(outdir, exist_ok=True)
 
     # ----- 데이터셋 (ROI + NSD 이미지) -----
@@ -548,12 +637,12 @@ def main():
         coco_id_vec=coco_id_vec
     )
 
-    # ----- 텍스트 인코더(Optimus 전용) -----
-    text_enc = OptimusMuEncoder(
+    # ----- 텍스트 인코더 (CLIP 텍스트) -----
+    text_enc = ClipTextEncoder(
         device=device,
-        preferred_latent_dim=args.latent_dim,
-        max_len=args.max_text_len,
-        optimus_ckpt=args.optimus_ckpt,
+        clip_variant=text_variant,
+        pretrained=args.clip_pretrained if hasattr(args, "clip_pretrained") else "openai",
+        normalize=args.clip_normalize if hasattr(args, "clip_normalize") else True,
     )
 
     # ===== 캡션 타깃 캐시  =====
@@ -571,6 +660,33 @@ def main():
         cache_path=args.cap_cache,
         device=device,
     )
+
+    with torch.no_grad():
+        z_t = torch.from_numpy(z_cache).to(device)  # [N, D]
+
+        finite_mask = torch.isfinite(z_t)  # elementwise mask
+        finite_all = bool(finite_mask.all().item())  # 전체가 유한한가
+        n_finite = int(finite_mask.sum().item())  # 유한 원소 수
+
+        # 평균 / 표준편차: 유한값만 사용
+        if n_finite > 0:
+            z_f = z_t[finite_mask]
+            mean_val = z_f.mean().item()
+            std_val = z_f.std(unbiased=False).item()  # 표본(Unbiased) 말고 모수 표준편차
+        else:
+            mean_val, std_val = float('nan'), float('nan')
+
+        # 행(벡터) 기준 L2 노름: 모든 원소가 유한한 행만 사용
+        row_ok = torch.isfinite(z_t).all(dim=-1)
+        if row_ok.any():
+            norm_mean = torch.linalg.vector_norm(z_t[row_ok], dim=-1).mean().item()
+        else:
+            norm_mean = float('nan')
+
+        print(f"[sanity] z_cache finite_all={finite_all}  "
+              f"n_finite={n_finite}/{z_t.numel()}  "
+              f"mean={mean_val:.4f}  std={std_val:.4f}  ||z||_mean={norm_mean:.4f}")
+
     z_cache_t = torch.from_numpy(z_cache).to(device)  # [N_trials, D]
     z_valid_t = torch.from_numpy(z_valid)  # CPU bool ok
     print(f"[cap-cache] ready: z_cache={tuple(z_cache_t.shape)}, valid={z_valid.sum()}", flush=True)
@@ -604,13 +720,14 @@ def main():
         if args.zscore_stats is not None:
             print(f"[roi] zscore_stats not found: {args.zscore_stats} -> skip.", flush=True)
 
+    out_dim_txt = int(text_enc.latent_dim)
     model = Voxel2TextLatent(
         in_dim=in_dim,
         hidden_dim=args.hidden_dim,
         token_dim=args.token_dim,
         mask_prob=args.mask_prob,
         proj_hidden=args.proj_hidden,
-        latent_dim=text_enc.latent_dim,
+        latent_dim=out_dim_txt,
         input_layernorm=args.input_layernorm,
         bottleneck_dim=args.bottleneck_dim,
     ).to(device)
@@ -637,93 +754,114 @@ def main():
     else:
         lr_scheduler = None
 
+    soft_clip_len = max(1, args.epochs - int(args.mixup_pct * args.epochs))
+    soft_loss_temps = utils.cosine_anneal(args.softclip_tmin, args.softclip_tmax, soft_clip_len)
+
     scaler = torch.cuda.amp.GradScaler(enabled=use_cuda)
 
-    # ----- 체크포인트 -----
-    def save_ckpt(tag: str, epoch_i: int, losses_tr: List[float], losses_val: List[float], lrs: List[float]):
-        ckpt_path = os.path.join(outdir, f"{tag}.pth")
-        print(f"[ckpt] saving {ckpt_path}", flush=True)
-        try:
-            torch.save({
-                "epoch": epoch_i,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "train_losses": losses_tr,
-                "val_losses": losses_val,
-                "lrs": lrs,
-            }, ckpt_path)
-        except Exception as e:
-            print(f"[ckpt] save failed: {e}", flush=True)
-
     # ----- 학습 루프 -----
-    best_val = 1e9
     train_losses: List[float] = []
-    val_losses: List[float] = []
     lrs_hist: List[float] = []
 
     progress_bar = tqdm(range(args.epochs), ncols=120, bar_format=BAR_FMT, file=sys.stdout, leave=True)
     for epoch in progress_bar:
         model.train()
-        tr_loss_sum = 0.0
+        sims_base = 0.0
+        fwd_percent_correct = 0.0
+        bwd_percent_correct = 0.0
+        loss_nce_sum = 0.0
 
         for step, (vox, img, trial) in enumerate(train_dl):
             optimizer.zero_grad(set_to_none=True)
 
-            # voxel 텐서 정리
             if vox.ndim == 2:
                 vox = vox.to(device).float()
             elif vox.ndim == 3:
-                # 반복 차원 있으면 step 기준으로 하나 선택
                 rep = step % vox.shape[1]
                 vox = vox[:, rep].to(device).float()
             else:
                 raise RuntimeError(f"Unexpected voxel shape: {vox.shape}")
-
+            # --- z-score ---
             if zscore_tensors is not None:
                 mean, std = zscore_tensors
                 vox = (vox - mean) / (std + 1e-6)
 
+            # --- (1) 타깃 유효성으로 먼저 필터링 ---
             trial_ids = trial.view(-1).tolist()
-            keep_idx = [i for i, t in enumerate(trial_ids) if (0 <= t < z_valid_t.numel()) and bool(z_valid_t[t])]
+            keep_idx = [i for i, t in enumerate(trial_ids)
+                        if (0 <= t < z_valid_t.numel()) and bool(z_valid_t[t])]
+
             if len(keep_idx) == 0:
-                continue
+                continue  # 전부 무효면 스킵
+
             if len(keep_idx) < vox.size(0):
                 vox = vox[keep_idx]
+            tid_tensor = torch.tensor([trial_ids[i] for i in keep_idx],
+                                      device=device, dtype=torch.long)
 
-            tid_tensor = torch.tensor([trial_ids[i] for i in keep_idx], device=device, dtype=torch.long)
-            z_targ = z_cache_t.index_select(dim=0, index=tid_tensor)  # [B', D]
+            with torch.no_grad():
+                z_targ = z_cache_t.index_select(dim=0, index=tid_tensor).float()  # [B', D]
 
-            # ---- fMRI → z_pred ----
+            # --- (2) 필터링 이후에 mixco 여부 결정 ---
+            use_mix = (epoch < int(args.mixup_pct * args.epochs)) and (vox.size(0) > 1)
+            if use_mix:
+                vox, perm, betas, select = utils.mixco(vox)
+
+            # --- (3) forward ---
             with torch.cuda.amp.autocast(enabled=use_cuda, dtype=torch.float16):
-                # voxel 경로는 fp32가 안전 → 모델 내부에서 자동 처리하고 싶다면 아래처럼 강제 캐스팅
-                vox_fp32 = vox.float()
-                z_pred = model(vox_fp32)  # [B', latent_dim]
-                loss = F.mse_loss(z_pred, z_targ)
+                z_pred = model(vox.float())  # [B', D]
 
-            scaler.scale(loss).backward()
+            # dtype 정리
+            z_pred = z_pred.float()
+            z_targ = z_targ.float()
+
+            # --- (4) 정규화 후 손실 ---
+            zq = F.normalize(z_pred.flatten(1), dim=-1)
+            zk = F.normalize(z_targ.flatten(1), dim=-1)
+
+            if use_mix:
+                # BiMixCo (대칭 InfoNCE 변형)
+                logits = (zq @ zk.t()) / args.nce_temp
+                # 체크: B'와 mixco 텐서 길이 일치
+                # assert logits.size(0) == perm.size(0) == select.size(0)
+                loss_nce = utils.mixco_nce(logits, perm=perm, betas=betas, select=select)
+            else:
+                # SoftCLIP
+                idx = epoch - int(args.mixup_pct * args.epochs)
+                epoch_temp = soft_loss_temps[min(idx, len(soft_loss_temps) - 1)]
+                loss_nce = utils.soft_clip_loss(zq, zk, temp=epoch_temp)
+
+            scaler.scale(loss_nce).backward()
             scaler.step(optimizer)
             scaler.update()
 
-            tr_loss_sum += float(loss.item())
-            train_losses.append(float(loss.item()))
+            train_losses.append(float(loss_nce.item()))
             lrs_hist.append(float(optimizer.param_groups[0]["lr"]))
+
+            # 로깅용 집계
+            loss_nce_sum += float(loss_nce.item())
+            sims_base += float(F.cosine_similarity(zk, zq).mean().item())
+            labels = torch.arange(zk.size(0), device=device)
+            fwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(zq, zk), labels, k=1)
+            bwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(zk, zq), labels, k=1)
 
             if lr_scheduler is not None:
                 lr_scheduler.step()
 
             if LOG_EVERY_N and ((step + 1) % LOG_EVERY_N == 0):
                 recent = float(np.mean(train_losses[-LOG_EVERY_N:])) if len(train_losses) >= LOG_EVERY_N else train_losses[-1]
-                print(f"[epoch {epoch+1}/{args.epochs} step {step+1}/{len(train_dl)}] "
-                      f"train/mse={recent:.4f} lr={optimizer.param_groups[0]['lr']:.2e}", flush=True)
+                print(f"[epoch {epoch + 1}/{args.epochs} step {step + 1}/{len(train_dl)}] "
+                      f"train/contrastive={recent:.4f} lr={optimizer.param_groups[0]['lr']:.2e}", flush=True)
 
         # ---- 검증 ----
         model.eval()
-        val_sum = 0.0
-        n_val = 0
-        val_cos_losses: List[float] = []
-        val_cos_acc = 0.0  # 초기화 (locals() 트릭 제거)
+        val_loss_nce_sum = 0.0
+        val_sims_base = 0.0
+        val_fwd_percent_correct = 0.0
+        val_bwd_percent_correct = 0.0
+        n_val_steps = 0
 
-        with torch.inference_mode():
+        with torch.no_grad():
             for val_i, (vox, img, trial) in enumerate(val_dl):
                 if vox.ndim == 2:
                     vox = vox.to(device).float()
@@ -732,69 +870,84 @@ def main():
                     vox = vox[:, rep].to(device).float()
                 else:
                     raise RuntimeError(f"Unexpected voxel shape: {vox.shape}")
-
                 if zscore_tensors is not None:
                     mean, std = zscore_tensors
                     vox = (vox - mean) / (std + 1e-6)
 
-                # ====== 캐시에서 타깃 로드 ======
                 trial_ids = trial.view(-1).tolist()
-                keep_idx = [i for i, t in enumerate(trial_ids)
-                            if (0 <= t < z_valid_t.numel()) and bool(z_valid_t[t])]
+                keep_idx = [i for i, t in enumerate(trial_ids) if (0 <= t < z_valid_t.numel()) and bool(z_valid_t[t])]
                 if len(keep_idx) == 0:
                     continue
                 if len(keep_idx) < vox.size(0):
                     vox = vox[keep_idx]
-
                 tid_tensor = torch.tensor([trial_ids[i] for i in keep_idx], device=device, dtype=torch.long)
-                z_targ = z_cache_t.index_select(dim=0, index=tid_tensor)  # [B', D]
 
-                z_pred = model(vox.float())
-                vloss = F.mse_loss(z_pred, z_targ)
-                val_sum += float(vloss.item())
-                n_val += 1
+                z_pred = model(vox.float()).float()
+                z_targ = z_cache_t.index_select(dim=0, index=tid_tensor).float()
 
-                if args.eval_cosine:
-                    z_pred_n = F.normalize(z_pred, dim=-1)
-                    z_targ_n = F.normalize(z_targ, dim=-1)
-                    cos = F.cosine_similarity(z_pred_n, z_targ_n, dim=-1)  # [B']
-                    val_cos_acc += float((1.0 - cos.mean()).item())
+                zq = F.normalize(z_pred.flatten(1), dim=-1)
+                zk = F.normalize(z_targ.flatten(1), dim=-1)
 
-        val_mean = (val_sum / max(1, n_val))
-        val_losses.append(val_mean)
+                if epoch < int(args.mixup_pct * args.epochs):
+                    logits = (zq @ zk.t()) / args.nce_temp
+                    labels = torch.arange(logits.size(0), device=logits.device)
+                    val_loss_nce = 0.5 * (F.cross_entropy(logits, labels) + F.cross_entropy(logits.t(), labels))
+                else:
+                    idx = epoch - int(args.mixup_pct * args.epochs)
+                    epoch_temp = soft_loss_temps[min(idx, len(soft_loss_temps) - 1)]
+                    val_loss_nce = utils.soft_clip_loss(zq, zk, temp=epoch_temp)
 
-        if args.eval_cosine:
-            val_cos_mean = (val_cos_acc / max(1, n_val))
-            val_cos_losses.append(val_cos_mean)
-        else:
-            val_cos_mean = float('nan')
+                val_loss_nce_sum += float(val_loss_nce.item())
+                val_sims_base += float(F.cosine_similarity(zk, zq).mean().item())
+                labels = torch.arange(zk.size(0), device=device)
+                val_fwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(zq, zk), labels, k=1)
+                val_bwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(zk, zq), labels, k=1)
+                n_val_steps += 1
+
+        # === 최종 집계 (에폭 로그용) ===
+        val_contrastive_loss = val_loss_nce_sum / max(1, n_val_steps)
+        val_cos_sim = val_sims_base / max(1, n_val_steps)
+        val_top1_img = val_fwd_percent_correct / max(1, n_val_steps)  # Image Retrieval (pred→img)
+        val_top1_brain = val_bwd_percent_correct / max(1, n_val_steps)  # Brain Retrieval (img→pred)
+
 
         logs = OrderedDict(
-            train_loss=tr_loss_sum / max(1, len(train_dl)),
-            val_loss=val_mean,
-            val_cos=val_cos_mean if args.eval_cosine else None,
+            train_loss=loss_nce_sum / max(1, (step + 1)),
+            val_contrastive_loss=val_contrastive_loss,
+            val_cos_sim=val_cos_sim,
+            val_top1_image=val_top1_img,
+            val_top1_brain=val_top1_brain,
             lr=optimizer.param_groups[0]["lr"],
         )
-        progress_bar.set_postfix(**{k: v for k, v in logs.items() if v is not None})
-        print(f"[epoch {epoch + 1}/{args.epochs}] train/mse={logs['train_loss']:.4f}  "
-              f"val/mse={logs['val_loss']:.4f}  "
-              f"{('val/1-cos=%.4f  ' % logs['val_cos']) if args.eval_cosine else ''}"
-              f"lr={logs['lr']:.2e}",
-              flush=True)
+        progress_bar.set_postfix(**logs)
+
+        print(
+            f"[epoch {epoch + 1}/{args.epochs}] "
+            f"tr/contrastive={logs['train_loss']:.4f}  "
+            f"val/contrastive={logs['val_contrastive_loss']:.4f}  "
+            f"val/cos={logs['val_cos_sim']:.4f}  "
+            f"top1(text)={logs['val_top1_image']:.3f}  "
+            f"top1(brain)={logs['val_top1_brain']:.3f}  "
+            f"lr={logs['lr']:.2e}",
+            flush=True
+        )
 
         def save_ckpt(tag: str, epoch_i: int, losses_tr: List[float], losses_val: List[float], lrs: List[float]):
             ckpt_path = os.path.join(outdir, f"{tag}.pth")
             print(f"[ckpt] saving {ckpt_path}", flush=True)
             try:
                 torch.save({
-                    "epoch": epoch_i,
+                    "epoch": epoch,
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
-                    "train_losses": losses_tr,
-                    "val_losses": losses_val,
-                    "val_cos_losses": val_cos_losses if args.eval_cosine else None,
-                    "lrs": lrs,
+                    "train_losses": train_losses,
+                    "val_contrastive": val_contrastive_loss,
+                    "val_cos_sim": val_cos_sim,
+                    "val_top1_image": val_top1_img,
+                    "val_top1_brain": val_top1_brain,
+                    "lrs": lrs_hist,
                 }, ckpt_path)
+
             except Exception as e:
                 print(f"[ckpt] save failed: {e}", flush=True)
 
